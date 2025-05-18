@@ -11,6 +11,7 @@ import gzip
 import json
 import csv
 import re
+import time
 import ipaddress
 from datetime import datetime
 from collections import defaultdict
@@ -89,56 +90,6 @@ class ZeekToNSLKDD:
             'srv_count', 'serror_rate', 'srv_serror_rate', 'rerror_rate'
         ]
 
-    def read_log_file(self, file_path):
-        """
-        Lit un fichier de log Zeek (gzippé ou non) et retourne les enregistrements sous forme de liste de dictionnaires.
-        
-        Args:
-            file_path (str): Chemin vers le fichier de log Zeek
-            
-        Returns:
-            list: Liste de dictionnaires représentant les enregistrements du fichier log
-        """
-        records = []
-        
-        # Vérifier si le fichier est gzippé
-        if file_path.endswith('.gz'):
-            open_func = gzip.open
-        else:
-            open_func = open
-        
-        try:
-            with open_func(file_path, 'rt', encoding='utf-8') as f:
-                # Ignorer les lignes de commentaire et l'en-tête
-                header = None
-                types = None
-                for line in f:
-                    line = line.strip()
-                    if line.startswith('#'):
-                        if line.startswith('#fields'):
-                            header = line[8:].strip().split('\t')
-                        elif line.startswith('#types'):
-                            types = line[7:].strip().split('\t')
-                        continue
-                    
-                    if header:
-                        values = line.split('\t')
-                        record = {}
-                        for i, field in enumerate(header):
-                            if i < len(values):
-                                # Gérer les valeurs manquantes (représentées par '-' dans Zeek)
-                                if values[i] == '-':
-                                    record[field] = None
-                                else:
-                                    record[field] = values[i]
-                            else:
-                                record[field] = None
-                        records.append(record)
-        except Exception as e:
-            print(f"Erreur lors de la lecture du fichier {file_path}: {e}")
-        
-        return records
-
     def is_new_file(self, file_path):
         """Vérifie si un fichier n'a pas encore été traité"""
         return file_path not in self.processed_files
@@ -153,9 +104,19 @@ class ZeekToNSLKDD:
 
         Args:
             real_time (bool): Si True, ne traite que les nouveaux fichiers depuis le dernier traitement
+            
+        Returns:
+            int: Nombre de nouvelles connexions extraites
         """
+        # Initialiser processed_files si ce n'est pas déjà fait et si on est en mode temps réel
+        if real_time and not hasattr(self, 'processed_files'):
+            self.processed_files = set()
+        
         # Initialiser conn_records pour éviter UnboundLocalError
         conn_records = []
+        
+        # Nombre de nouvelles connexions détectées
+        new_connections = 0
 
         # Parcourir tous les fichiers de logs dans le répertoire
         for date_dir in os.listdir(self.zeek_logs_dir):
@@ -174,7 +135,7 @@ class ZeekToNSLKDD:
 
             for conn_log in conn_logs:
                 try:
-                    current_records = self.read_log_file(os.path.join(date_path, conn_log))
+                    current_records, _ = self.read_log_file(os.path.join(date_path, conn_log))
                     if current_records:
                         conn_records.extend(current_records)
                         # Marquer le fichier comme traité pour le mode temps réel
@@ -185,7 +146,6 @@ class ZeekToNSLKDD:
                     continue
 
             # Traitement des enregistrements
-            new_connections = 0
             for record in conn_records:
                 if not record or 'uid' not in record:
                     continue
@@ -222,10 +182,10 @@ class ZeekToNSLKDD:
                     new_connections += 1
 
             # Enrichir avec les données des autres logs (HTTP, DNS, SSL, etc.)
-            self.enrich_with_protocol_logs(date_path, real_time)
+            self.enrich_with_protocol_logs(date_path)
 
-            return new_connections
-            
+        return new_connections
+
     def enrich_with_protocol_logs(self, date_path):
         """
         Enrichit les données de connexion avec les informations des logs spécifiques aux protocoles.
@@ -250,7 +210,7 @@ class ZeekToNSLKDD:
             log_files = [f for f in os.listdir(date_path) if f.startswith(prefix) and f.endswith('.log.gz')]
             
             for log_file in log_files:
-                records = self.read_log_file(os.path.join(date_path, log_file))
+                records, _ = self.read_log_file(os.path.join(date_path, log_file))
                 
                 for record in records:
                     if not record or 'uid' not in record:
@@ -629,126 +589,355 @@ class ZeekToNSLKDD:
         print("Conversion terminée avec succès!")
 
     def monitor_real_time_logs(self, interval=60):
-        """Surveille les logs Zeek en temps réel"""
+        """
+        Surveille les logs Zeek en temps réel et traite uniquement les nouvelles entrées à chaque intervalle.
+        
+        Args:
+            interval (int): Intervalle de temps entre chaque vérification en secondes
+        """
+        import time
+        import json
+        import os
+        from datetime import datetime
+        
         print(f"Surveillance des logs en temps réel démarrée. Intervalle: {interval} secondes")
-        print(f"Répertoire de surveillance: {self.zeek_logs_dir}")
+        print(f"Répertoire de surveillance: {self.real_time_logs_dir}")
         print("Appuyez sur Ctrl+C pour arrêter...\n")
 
-        # Initialiser l'ensemble des fichiers déjà traités
-        self.processed_files = set()
-
+        # Fichier pour stocker les positions
+        positions_file = "zeek_log_positions.json"
+        
+        # Dictionnaire pour stocker les numéros de ligne des fichiers
+        file_positions = {}
+        
+        # Liste des fichiers connus pour détecter les nouveaux fichiers après redémarrage
+        known_files = set()
+        
+        # Charger les positions précédentes si le fichier existe
+        if os.path.exists(positions_file):
+            try:
+                with open(positions_file, 'r') as f:
+                    file_positions = json.load(f)
+                print(f"Positions de lecture chargées: {len(file_positions)} fichiers")
+                
+                # Ajouter les fichiers chargés à la liste des fichiers connus
+                known_files = set(file_positions.keys())
+            except Exception as e:
+                print(f"Erreur lors du chargement des positions: {e}")
+        
+        # Compteur de vérifications consécutives sans nouvelles connexions
+        consecutive_empty_checks = 0
+        
         try:
             while True:
                 print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Traitement des nouveaux logs...")
+                
+                # Vérifier s'il y a de nouveaux fichiers (potentiellement après un redémarrage de Zeek)
+                current_files = set()
+                for f in os.listdir(self.real_time_logs_dir):
+                    if f.endswith('.log') and not f.startswith('stderr') and not f.startswith('stdout'):
+                        current_files.add(os.path.join(self.real_time_logs_dir, f))
+                
+                # Détecter les nouveaux fichiers
+                new_files = current_files - known_files
+                if new_files:
+                    print(f"Nouveaux fichiers détectés: {len(new_files)}")
+                    for new_file in new_files:
+                        print(f"  - {os.path.basename(new_file)}")
+                        # Réinitialiser la position pour les nouveaux fichiers
+                        file_positions[new_file] = 0
+                    
+                    # Mettre à jour la liste des fichiers connus
+                    known_files = current_files
+                
+                # Vérifier si des fichiers ont disparu (supprimés ou renommés)
+                missing_files = known_files - current_files
+                if missing_files:
+                    print(f"Fichiers disparus: {len(missing_files)}")
+                    for missing_file in missing_files:
+                        print(f"  - {os.path.basename(missing_file)}")
+                        # Supprimer les fichiers manquants du dictionnaire de positions
+                        if missing_file in file_positions:
+                            del file_positions[missing_file]
+                    
+                    # Mettre à jour la liste des fichiers connus
+                    known_files = current_files
 
-                # Extraire seulement les nouvelles connexions
-                new_connections = self.extract_connection_data(real_time=True)
+                # Extraire seulement les nouvelles connexions et mettre à jour les positions
+                # Si plusieurs échecs consécutifs, réinitialiser les positions pour forcer une relecture complète
+                if consecutive_empty_checks >= 3:
+                    print("Plusieurs vérifications sans nouvelles connexions. Réinitialisation des positions...")
+                    file_positions = {f: 0 for f in file_positions}
+                    consecutive_empty_checks = 0
+
+                new_connections, file_positions = self.extract_real_time_connection_data(file_positions)
+
+                # Sauvegarder les positions pour la prochaine exécution
+                try:
+                    with open(positions_file, 'w') as f:
+                        json.dump(file_positions, f)
+                except Exception as e:
+                    print(f"Erreur lors de la sauvegarde des positions: {e}")
 
                 if new_connections > 0:
-                    # Écrire les nouvelles données dans le fichier CSV
-                    self.write_to_csv()
-                    print(f"Nombre de connexions extraites en temps réel: {new_connections}")
+                    # Calculer les caractéristiques NSL-KDD pour les nouvelles connexions
+                    nslkdd_records = self.compute_nslkdd_features()
+                    
+                    # Ajouter les nouvelles données au fichier CSV
+                    self.append_to_nslkdd_file(nslkdd_records)
+                    
                     print(f"Données ajoutées au fichier CSV: {new_connections} enregistrements\n")
+                    consecutive_empty_checks = 0  # Réinitialiser le compteur d'échecs
                 else:
                     print("Aucune nouvelle connexion détectée depuis le dernier intervalle\n")
+                    consecutive_empty_checks += 1
 
                 time.sleep(interval)
         except KeyboardInterrupt:
             print("\nSurveillance arrêtée par l'utilisateur.")
+            # Sauvegarder les positions avant de quitter
+            try:
+                with open(positions_file, 'w') as f:
+                    json.dump(file_positions, f)
+                print(f"Positions de lecture sauvegardées dans {positions_file}")
+            except Exception as e:
+                print(f"Erreur lors de la sauvegarde des positions: {e}")
 
-    def extract_real_time_connection_data(self):
+    def extract_real_time_connection_data(self, file_positions=None):
         """
         Extrait les données de connexion depuis les logs en temps réel de Zeek.
+        Ne traite que les nouvelles entrées depuis la dernière lecture.
+
+        Args:
+            file_positions (dict): Dictionnaire des positions de départ pour chaque fichier log
+
+        Returns:
+            tuple: (nombre de nouvelles connexions, dictionnaire mis à jour des positions de fichier)
         """
         import os
+
+        # Initialiser le dictionnaire des positions si non fourni
+        if file_positions is None:
+            file_positions = {}
+            
+        # Réinitialiser le dictionnaire des connexions pour détecter les nouvelles connexions
+        # même après redémarrage du script
+        self.connections = {}
 
         # Vérifier que le répertoire des logs en temps réel existe
         if not os.path.exists(self.real_time_logs_dir):
             print(f"ERREUR: Le répertoire des logs en temps réel '{self.real_time_logs_dir}' n'existe pas.")
-            return
+            return 0, file_positions
 
         # Liste des fichiers log à traiter
-        log_files = {
-            'conn': 'conn.log',
-            'dns': 'dns.log',
-            'http': 'http.log',
-            'ssh': 'ssh.log',
-            'ssl': 'ssl.log',
-            'files': 'files.log',
-            'weird': 'weird.log',
-            'notice': 'notice.log',
-            'software': 'software.log',
-            'ntp': 'ntp.log'
-        }
+        log_files_to_check = []
+        
+        # Obtenir la liste de tous les fichiers dans le répertoire
+        for f in os.listdir(self.real_time_logs_dir):
+            # Filtrer pour n'inclure que les fichiers .log (non compressés en temps réel)
+            if f.endswith('.log') and not f.startswith('stderr') and not f.startswith('stdout'):
+                log_files_to_check.append(f)
+        
+        print(f"Fichiers de log trouvés: {len(log_files_to_check)}")
+        
+        if not log_files_to_check:
+            print("Aucun fichier log trouvé dans le répertoire de surveillance.")
+            return 0, file_positions
 
-        # Traiter d'abord le fichier conn.log pour établir les connexions de base
-        conn_file = os.path.join(self.real_time_logs_dir, log_files['conn'])
+        # Nombre de nouvelles connexions détectées
+        new_connections = 0
+        
+        # Dictionnaire temporaire pour stocker les UIDs des logs de service qui seront traités plus tard
+        service_logs_uids = {}
+
+        # Première étape: Traiter conn.log pour établir les connexions de base
+        conn_file = os.path.join(self.real_time_logs_dir, 'conn.log')
+        
         if os.path.exists(conn_file):
-            conn_records = self.read_log_file(conn_file)
+            # Obtenir le numéro de ligne à partir duquel commencer la lecture
+            start_line = file_positions.get(conn_file, 0)
+            print(f"Lecture de {conn_file} depuis la ligne {start_line}")
+            
+            try:
+                with open(conn_file, 'r', encoding='utf-8') as f:
+                    # Ignorer les lignes déjà lues
+                    for _ in range(start_line):
+                        next(f, None)
+                    
+                    # Définir les variables pour le parsing
+                    header = None
+                    lines_read = 0
+                    current_line = start_line
+                    
+                    # Lire et parser les nouvelles lignes
+                    for line in f:
+                        current_line += 1
+                        lines_read += 1
+                        line = line.strip()
+                        
+                        # Ignorer les lignes vides ou commentées, mais traiter l'en-tête
+                        if not line or line.startswith('#') and not line.startswith('#fields'):
+                            continue
+                        
+                        # Capturer l'en-tête
+                        if line.startswith('#fields'):
+                            header = line[8:].strip().split('\t')
+                            continue
+                        
+                        # Si on n'a pas encore trouvé l'en-tête, continuer
+                        if not header:
+                            continue
+                        
+                        # Parser la ligne de données
+                        values = line.split('\t')
+                        if len(values) > 1:  # S'assurer qu'il y a assez de valeurs
+                            record = {}
+                            for i, field in enumerate(header):
+                                if i < len(values):
+                                    # Gérer les valeurs manquantes (représentées par '-' dans Zeek)
+                                    if values[i] == '-':
+                                        record[field] = None
+                                    else:
+                                        record[field] = values[i]
+                                else:
+                                    record[field] = None
+                            
+                            # Ajouter l'enregistrement si un UID valide est présent
+                            if 'uid' in record and record['uid']:
+                                uid = record['uid']
+                                
+                                # Valider le timestamp
+                                ts = record.get('ts')
+                                if not ts or '\x00' in ts or not ts.replace('.', '').replace('-', '').isdigit():
+                                    print(f"Skipping invalid timestamp '{ts}' for connection {uid}")
+                                    continue
+                                
+                                # Enregistrer la connexion
+                                self.connections[uid] = {
+                                    'ts': ts,
+                                    'uid': uid,
+                                    'id.orig_h': record.get('id.orig_h'),
+                                    'id.orig_p': record.get('id.orig_p'),
+                                    'id.resp_h': record.get('id.resp_h'),
+                                    'id.resp_p': record.get('id.resp_p'),
+                                    'proto': record.get('proto'),
+                                    'service': record.get('service'),
+                                    'duration': record.get('duration'),
+                                    'orig_bytes': record.get('orig_bytes'),
+                                    'resp_bytes': record.get('resp_bytes'),
+                                    'conn_state': record.get('conn_state'),
+                                    'missed_bytes': record.get('missed_bytes'),
+                                    'history': record.get('history'),
+                                    'orig_pkts': record.get('orig_pkts'),
+                                    'orig_ip_bytes': record.get('orig_ip_bytes'),
+                                    'resp_pkts': record.get('resp_pkts'),
+                                    'resp_ip_bytes': record.get('resp_ip_bytes')
+                                }
+                                new_connections += 1
+                    
+                    # Mettre à jour le nombre de lignes lues
+                    file_positions[conn_file] = current_line
+                    print(f"Lecture de conn.log: {new_connections} connexions trouvées sur {lines_read} lignes")
+                    print(f"Nouvelle position pour conn.log: ligne {current_line}")
+            
+            except Exception as e:
+                print(f"Erreur lors de la lecture du fichier {conn_file}: {e}")
 
-            for record in conn_records:
-                if not record or 'uid' not in record:
-                    continue
-
-                ts = record.get('ts')
-                # Valider le timestamp
-                if not ts or '\x00' in ts or not ts.replace('.', '').replace('-', '').isdigit():
-                    print(f"Skipping invalid timestamp '{ts}' for connection {record.get('uid', 'unknown')}")
-                    continue
-
-                uid = record['uid']
-                # Ne pas traiter les connexions déjà traitées
-                if uid in self.connections:
-                    continue
-
-                self.connections[uid] = {
-                    'ts': ts,
-                    'uid': uid,
-                    'id.orig_h': record.get('id.orig_h'),
-                    'id.orig_p': record.get('id.orig_p'),
-                    'id.resp_h': record.get('id.resp_h'),
-                    'id.resp_p': record.get('id.resp_p'),
-                    'proto': record.get('proto'),
-                    'service': record.get('service'),
-                    'duration': record.get('duration'),
-                    'orig_bytes': record.get('orig_bytes'),
-                    'resp_bytes': record.get('resp_bytes'),
-                    'conn_state': record.get('conn_state'),
-                    'missed_bytes': record.get('missed_bytes'),
-                    'history': record.get('history'),
-                    'orig_pkts': record.get('orig_pkts'),
-                    'orig_ip_bytes': record.get('orig_ip_bytes'),
-                    'resp_pkts': record.get('resp_pkts'),
-                    'resp_ip_bytes': record.get('resp_ip_bytes')
-                }
-
-        # Ensuite, enrichir avec les autres fichiers de log
-        for log_type, file_name in log_files.items():
-            if log_type == 'conn':  # Déjà traité
+        # Deuxième étape: Enrichir avec les données des autres logs (http, dns, etc.)
+        print("Enrichissement des connexions avec les données des services spécifiques...")
+        
+        for log_file in log_files_to_check:
+            if log_file == 'conn.log':  # Déjà traité
                 continue
 
-            file_path = os.path.join(self.real_time_logs_dir, file_name)
+            file_path = os.path.join(self.real_time_logs_dir, log_file)
             if not os.path.exists(file_path):
                 continue
-
-            records = self.read_log_file(file_path)
-
-            for record in conn_records:
-                if not record or 'uid' not in record:
-                    continue
-
-                uid = record['uid']
-                if uid in self.connections:
-                    # Enrichir la connexion existante avec les données spécifiques au protocole
-                    if log_type not in self.connections[uid]:
-                        self.connections[uid][log_type] = []
-                    self.connections[uid][log_type].append(record)
-
-                    # Si le service n'est pas défini dans les données de connexion, le définir
-                    if not self.connections[uid]['service'] and log_type in ['http', 'dns', 'ssh', 'ssl', 'ftp', 'smtp']:
-                        self.connections[uid]['service'] = log_type
-
-        print(f"Nombre de connexions extraites en temps réel: {len(self.connections)}")
+            
+            # Déterminer le type de service à partir du nom du fichier
+            log_type = log_file.split('.')[0]
+            service_logs_uids[log_type] = set()  # Pour suivre les UIDs trouvés dans ce log
+            
+            # Obtenir le numéro de ligne à partir duquel commencer la lecture
+            start_line = file_positions.get(file_path, 0)
+            
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    # Ignorer les lignes déjà lues
+                    for _ in range(start_line):
+                        next(f, None)
+                    
+                    # Définir les variables pour le parsing
+                    header = None
+                    lines_read = 0
+                    current_line = start_line
+                    enriched_count = 0
+                    
+                    # Lire et parser les nouvelles lignes
+                    for line in f:
+                        current_line += 1
+                        lines_read += 1
+                        line = line.strip()
+                        
+                        # Ignorer les lignes vides ou commentées, mais traiter l'en-tête
+                        if not line or line.startswith('#') and not line.startswith('#fields'):
+                            continue
+                        
+                        # Capturer l'en-tête
+                        if line.startswith('#fields'):
+                            header = line[8:].strip().split('\t')
+                            continue
+                        
+                        # Si on n'a pas encore trouvé l'en-tête, continuer
+                        if not header:
+                            continue
+                        
+                        # Parser la ligne de données
+                        values = line.split('\t')
+                        if len(values) > 1:  # S'assurer qu'il y a assez de valeurs
+                            record = {}
+                            for i, field in enumerate(header):
+                                if i < len(values):
+                                    # Gérer les valeurs manquantes (représentées par '-' dans Zeek)
+                                    if values[i] == '-':
+                                        record[field] = None
+                                    else:
+                                        record[field] = values[i]
+                                else:
+                                    record[field] = None
+                            
+                            # Traiter l'enregistrement s'il contient un UID
+                            if 'uid' in record and record['uid']:
+                                uid = record['uid']
+                                service_logs_uids[log_type].add(uid)
+                                
+                                # Si la connexion existe déjà, l'enrichir avec ces données
+                                if uid in self.connections:
+                                    if log_type not in self.connections[uid]:
+                                        self.connections[uid][log_type] = []
+                                    self.connections[uid][log_type].append(record)
+                                    
+                                    # Si le service n'est pas défini, le définir en fonction du type de log
+                                    if not self.connections[uid]['service'] and log_type in ['http', 'dns', 'ssh', 'ssl', 'ftp', 'smtp']:
+                                        self.connections[uid]['service'] = log_type
+                                    
+                                    enriched_count += 1
+                    
+                    # Mettre à jour le nombre de lignes lues
+                    file_positions[file_path] = current_line
+                    if lines_read > 0:
+                        print(f"Lecture de {log_file}: {lines_read} lignes, {enriched_count} connexions enrichies")
+                        print(f"  UIDs uniques trouvés dans {log_file}: {len(service_logs_uids[log_type])}")
+                        print(f"Nouvelle position pour {log_file}: ligne {current_line}")
+            
+            except Exception as e:
+                print(f"Erreur lors de la lecture du fichier {file_path}: {e}")
+        
+        # Statistiques finales
+        print(f"Nouvelles connexions détectées: {new_connections}")
+        print(f"Nombre total de connexions en mémoire: {len(self.connections)}")
+        
+        return new_connections, file_positions
 
     def append_to_nslkdd_file(self, nslkdd_records):
         """
@@ -935,6 +1124,61 @@ class ZeekToNSLKDD:
         except Exception as e:
             print(f"ERREUR lors de l'insertion dans ElasticSearch: {e}")
 
+    def verify_file_positions(self, file_positions):
+        """
+        Vérifie la cohérence entre les positions de lecture et les tailles actuelles des fichiers.
+        
+        Args:
+            file_positions (dict): Dictionnaire des positions de lecture des fichiers
+            
+        Returns:
+            dict: Dictionnaire mis à jour des positions de lecture
+        """
+        import os
+        
+        updated_positions = file_positions.copy()
+        files_to_reset = []
+        
+        print("Vérification des positions de fichiers...")
+        
+        for file_path, position in file_positions.items():
+            if not os.path.exists(file_path):
+                print(f"Fichier non trouvé: {file_path}, position réinitialisée")
+                files_to_reset.append(file_path)
+                continue
+                
+            file_size = os.path.getsize(file_path)
+            
+            # Si le fichier est plus petit que la position enregistrée, il a probablement été recréé
+            if position > file_size + 100:  # Marge de tolérance de 100 octets
+                print(f"Anomalie de position détectée pour {file_path}")
+                print(f"  Position enregistrée: {position}, Taille du fichier: {file_size}")
+                files_to_reset.append(file_path)
+                
+            # Vérifier si le fichier a peu évolué malgré beaucoup de lignes
+            try:
+                with open(file_path, 'r') as f:
+                    line_count = sum(1 for _ in f)
+                avg_line_size = file_size / max(line_count, 1)
+                estimated_lines_read = position / max(avg_line_size, 1) if avg_line_size > 0 else 0
+                
+                if position > 0 and line_count > 10 and estimated_lines_read > line_count * 1.5:
+                    print(f"Possible problème de lecture pour {file_path}")
+                    print(f"  Nombre de lignes: {line_count}, Estimation des lignes lues: {int(estimated_lines_read)}")
+                    files_to_reset.append(file_path)
+            except Exception as e:
+                print(f"Erreur lors de l'analyse du fichier {file_path}: {e}")
+        
+        # Réinitialiser les positions problématiques
+        for file_path in set(files_to_reset):
+            updated_positions[file_path] = 0
+            print(f"Position réinitialisée pour {file_path}")
+        
+        if files_to_reset:
+            print(f"{len(files_to_reset)} fichiers ont eu leur position réinitialisée.")
+        
+        return updated_positions
+
 
 def main():
     """
@@ -976,4 +1220,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
