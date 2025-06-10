@@ -13,6 +13,7 @@ import pandas as pd
 import numpy as np
 from collections import deque
 from datetime import datetime
+from io import StringIO
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -141,7 +142,7 @@ class RealtimePredictor:
                             new_lines = new_lines[1:]
                         
                         # Convertir les nouvelles lignes en DataFrame
-                        df_new = pd.read_csv(pd.StringIO(''.join(new_lines)), 
+                        df_new = pd.read_csv(StringIO(''.join(new_lines)), 
                                            names=self.columns)
                         
                         # Prétraiter les données
@@ -156,8 +157,8 @@ class RealtimePredictor:
                         for i, (pred, prob) in enumerate(zip(predictions, probabilities)):
                             prediction_info = {
                                 'timestamp': timestamp,
-                                'prediction': 'ATTACK' if pred == 1 else 'NORMAL',
-                                'confidence': prob[1] if pred == 1 else prob[0],
+                                'prediction': 'NORMAL' if pred == 0 else 'ATTACK',
+                                'confidence': prob[0] if pred == 0 else prob[1],
                                 'data': df_new.iloc[i].to_dict()
                             }
                             self.predictions_history.append(prediction_info)
