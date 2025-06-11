@@ -1,0 +1,18 @@
+[Unit]
+Description=IDS Intelligent System
+After=network.target zeek.service
+Requires=zeek.service
+
+[Service]
+Type=simple
+User=lan
+Group=lan
+WorkingDirectory=/home/lan/IDS-Intelligent
+ExecStart=/bin/bash /home/lan/IDS-Intelligent/start_ids.sh
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target 
