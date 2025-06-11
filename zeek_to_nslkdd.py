@@ -31,7 +31,10 @@ class ZeekToNSLKDD:
         self.real_time = real_time
         self.es_integration = es_integration
         self.real_time_logs_dir = "/opt/zeek/spool/zeek"  # Répertoire des logs en temps réel
-
+        
+        # Timestamp du dernier événement traité
+        self.last_processed_timestamp = 0.0
+        
         # Configuration ElasticSearch
         self.es_config = {
             "url": "https://elasticsearch.service:9200",
@@ -89,12 +92,14 @@ class ZeekToNSLKDD:
             'srv_count', 'serror_rate', 'srv_serror_rate', 'rerror_rate'
         ]
 
-    def read_log_file(self, file_path):
+    def read_log_file(self, file_path, min_timestamp=0.0):
         """
         Lit un fichier de log Zeek (gzippé ou non) et retourne les enregistrements sous forme de liste de dictionnaires.
+        Ne retourne que les enregistrements dont le timestamp est supérieur à min_timestamp.
         
         Args:
             file_path (str): Chemin vers le fichier de log Zeek
+            min_timestamp (float): Timestamp minimum pour filtrer les enregistrements
             
         Returns:
             list: Liste de dictionnaires représentant les enregistrements du fichier log
@@ -126,17 +131,28 @@ class ZeekToNSLKDD:
                         record = {}
                         for i, field in enumerate(header):
                             if i < len(values):
-                                # Gérer les valeurs manquantes (représentées par '-' dans Zeek)
                                 if values[i] == '-':
                                     record[field] = None
                                 else:
                                     record[field] = values[i]
                             else:
                                 record[field] = None
-                        records.append(record)
+                        
+                        # Ne garder que les enregistrements plus récents que min_timestamp
+                        if 'ts' in record and record['ts']:
+                            try:
+                                ts = float(record['ts'])
+                                if ts > min_timestamp:
+                                    records.append(record)
+                                    print(f"Lecture d'un nouvel enregistrement avec timestamp {ts}")
+                            except (ValueError, TypeError) as e:
+                                print(f"Erreur de conversion du timestamp: {e}")
+                                continue
+                
         except Exception as e:
             print(f"Erreur lors de la lecture du fichier {file_path}: {e}")
         
+        print(f"Nombre d'enregistrements lus depuis {file_path}: {len(records)}")
         return records
 
     def extract_connection_data(self):
@@ -582,7 +598,9 @@ class ZeekToNSLKDD:
 
         try:
             while True:
-                print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Traitement des nouveaux logs...")
+                current_time = datetime.now()
+                print(f"\n[{current_time.strftime('%Y-%m-%d %H:%M:%S')}] Traitement des nouveaux logs...")
+                print(f"Dernier timestamp traité: {self.last_processed_timestamp}")
 
                 # Extraire et traiter les logs en temps réel
                 self.extract_real_time_connection_data()
@@ -616,6 +634,7 @@ class ZeekToNSLKDD:
     def extract_real_time_connection_data(self):
         """
         Extrait les données de connexion depuis les logs en temps réel de Zeek.
+        Ne traite que les entrées plus récentes que le dernier timestamp traité.
         """
         import os
 
@@ -641,17 +660,14 @@ class ZeekToNSLKDD:
         # Traiter d'abord le fichier conn.log pour établir les connexions de base
         conn_file = os.path.join(self.real_time_logs_dir, log_files['conn'])
         if os.path.exists(conn_file):
-            conn_records = self.read_log_file(conn_file)
+            print(f"Lecture du fichier {conn_file} avec min_timestamp={self.last_processed_timestamp}")
+            conn_records = self.read_log_file(conn_file, self.last_processed_timestamp)
 
             for record in conn_records:
                 if not record or 'uid' not in record:
                     continue
 
                 uid = record['uid']
-                # Ne pas traiter les connexions déjà traitées
-                if uid in self.connections:
-                    continue
-
                 self.connections[uid] = {
                     'ts': record.get('ts'),
                     'uid': uid,
@@ -682,7 +698,8 @@ class ZeekToNSLKDD:
             if not os.path.exists(file_path):
                 continue
 
-            records = self.read_log_file(file_path)
+            print(f"Lecture du fichier {file_path} avec min_timestamp={self.last_processed_timestamp}")
+            records = self.read_log_file(file_path, self.last_processed_timestamp)
 
             for record in records:
                 if not record or 'uid' not in record:
@@ -690,14 +707,21 @@ class ZeekToNSLKDD:
 
                 uid = record['uid']
                 if uid in self.connections:
-                    # Enrichir la connexion existante avec les données spécifiques au protocole
                     if log_type not in self.connections[uid]:
                         self.connections[uid][log_type] = []
                     self.connections[uid][log_type].append(record)
 
-                    # Si le service n'est pas défini dans les données de connexion, le définir
                     if not self.connections[uid]['service'] and log_type in ['http', 'dns', 'ssh', 'ssl', 'ftp', 'smtp']:
                         self.connections[uid]['service'] = log_type
+
+        # Mettre à jour le dernier timestamp traité
+        if self.connections:
+            timestamps = [float(conn['ts']) for conn in self.connections.values() if conn.get('ts')]
+            if timestamps:
+                new_timestamp = max(timestamps)
+                if new_timestamp > self.last_processed_timestamp:
+                    self.last_processed_timestamp = new_timestamp
+                    print(f"Mise à jour du dernier timestamp traité: {self.last_processed_timestamp}")
 
         print(f"Nombre de connexions extraites en temps réel: {len(self.connections)}")
 
